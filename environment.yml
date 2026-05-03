@@ -1,0 +1,18 @@
+name: doi-downloader
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python>=3.11
+  - pip
+  - pip:
+    - httpx>=0.27
+    - playwright>=1.40
+    - tqdm>=4.66
+    - openpyxl>=3.1
+    - click>=8.1
+    - beautifulsoup4>=4.12
+    # Dev dependencies
+    - pytest>=8.0
+    - pytest-cov>=4.1
+    - respx>=0.21
