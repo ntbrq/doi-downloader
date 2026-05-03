@@ -10,8 +10,10 @@ from doi_downloader.config import Config
 from doi_downloader.downloader import BatchDownloader, DownloadResult
 from doi_downloader.input_parser import parse_dois
 from doi_downloader.metadata import resolve_metadata
+from doi_downloader.sources.direct_url import DirectUrlSource
 from doi_downloader.sources.publisher import PublisherSource
 from doi_downloader.sources.scihub import SciHubSource
+from doi_downloader.sources.semantic_scholar import SemanticScholarSource
 from doi_downloader.sources.unpaywall import UnpaywallSource
 
 
@@ -20,9 +22,9 @@ from doi_downloader.sources.unpaywall import UnpaywallSource
 @click.option("-o", "--output", "output_dir", type=click.Path(path_type=Path), required=True, help="Output directory for PDFs")
 @click.option("-w", "--workers", type=int, default=8, help="Number of download threads")
 @click.option("--scihub-url", default="https://sci-hub.se", help="Sci-Hub mirror URL")
-@click.option("--email", default="user@example.com", help="Email for Unpaywall API")
+@click.option("--email", default="doi-downloader@github.com", help="Email for Unpaywall API (required by Unpaywall)")
 def main(input_file: Path, output_dir: Path, workers: int, scihub_url: str, email: str):
-    """DOI 批量下载工具。根据 DOI 列表批量下载学术论文 PDF。"""
+    """DOI batch download tool. Download academic paper PDFs by DOI list."""
     click.echo(f"Reading DOIs from {input_file}...")
     try:
         dois = parse_dois(input_file)
@@ -37,9 +39,11 @@ def main(input_file: Path, output_dir: Path, workers: int, scihub_url: str, emai
     click.echo(f"Found {len(dois)} unique DOIs.")
 
     sources = [
-        PublisherSource(timeout=30.0),
-        SciHubSource(base_url=scihub_url, timeout=60.0),
+        DirectUrlSource(timeout=60.0, max_retries=2),
+        PublisherSource(timeout=60.0, max_retries=2),
+        SemanticScholarSource(timeout=30.0),
         UnpaywallSource(email=email, timeout=30.0),
+        SciHubSource(base_url=scihub_url, timeout=60.0),
     ]
 
     config = Config(max_download_workers=workers, scihub_url=scihub_url, unpaywall_email=email)

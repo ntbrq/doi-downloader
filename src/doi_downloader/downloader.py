@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import httpx
+from bs4 import BeautifulSoup
+
 from doi_downloader.config import Config
 from doi_downloader.metadata import PaperMetadata
 from doi_downloader.renamer import rename_pdf
@@ -31,6 +34,47 @@ class BatchDownloader:
         self.max_workers = max_workers
         self.config = config or Config()
 
+    def _try_download(self, url: str, source: DownloadSource, tmp_path: Path, metadata: PaperMetadata, output_dir: Path) -> DownloadResult | None:
+        """尝试从 URL 下载 PDF。如果 URL 返回 HTML，尝试提取 PDF 链接。"""
+        if source.download(url, tmp_path):
+            if source.is_pdf(tmp_path):
+                final_path = rename_pdf(tmp_path, metadata, output_dir)
+                return DownloadResult(
+                    doi=metadata.doi,
+                    success=True,
+                    file_path=final_path,
+                    source_used=source.name,
+                )
+            else:
+                tmp_path.unlink(missing_ok=True)
+
+        # 下载失败或不是 PDF — 尝试从 URL 获取的 HTML 中提取 PDF 链接
+        try:
+            client = httpx.Client(timeout=30, follow_redirects=True)
+            resp = client.get(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+            if resp.status_code == 200 and "text/html" in resp.headers.get("content-type", ""):
+                soup = BeautifulSoup(resp.text, "html.parser")
+                # 尝试 citation_pdf_url meta
+                for meta in soup.find_all("meta", attrs={"name": "citation_pdf_url"}):
+                    pdf_url = meta.get("content")
+                    if pdf_url and source.download(pdf_url, tmp_path):
+                        if source.is_pdf(tmp_path):
+                            final_path = rename_pdf(tmp_path, metadata, output_dir)
+                            return DownloadResult(
+                                doi=metadata.doi,
+                                success=True,
+                                file_path=final_path,
+                                source_used=f"{source.name}+html",
+                            )
+                        else:
+                            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        return None
+
     def _download_one(
         self,
         doi: str,
@@ -50,17 +94,9 @@ class BatchDownloader:
                     continue
 
                 tmp_path = output_dir / f".tmp_{doi.replace('/', '_')}.pdf"
-                if source.download(url, tmp_path):
-                    if source.is_pdf(tmp_path):
-                        final_path = rename_pdf(tmp_path, metadata, output_dir)
-                        return DownloadResult(
-                            doi=doi,
-                            success=True,
-                            file_path=final_path,
-                            source_used=source.name,
-                        )
-                    else:
-                        tmp_path.unlink(missing_ok=True)
+                result = self._try_download(url, source, tmp_path, metadata, output_dir)
+                if result:
+                    return result
             except Exception:
                 continue
 
