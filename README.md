@@ -16,7 +16,7 @@ A batch DOI paper PDF downloader with multi-threaded downloading, multi-source f
 ### pip (recommended)
 
 ```bash
-git clone https://github.com/rdbao/doi-downloader.git
+git clone https://github.com/ntbrq/doi-downloader.git
 cd doi-downloader
 pip install -e ".[dev]"
 playwright install chromium
@@ -25,7 +25,7 @@ playwright install chromium
 ### conda
 
 ```bash
-git clone https://github.com/rdbao/doi-downloader.git
+git clone https://github.com/ntbrq/doi-downloader.git
 cd doi-downloader
 conda env create -f environment.yml
 conda activate doi-downloader
