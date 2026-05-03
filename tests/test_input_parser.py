@@ -1,5 +1,6 @@
 from pathlib import Path
 import pytest
+from openpyxl import Workbook
 
 from doi_downloader.input_parser import parse_dois
 
@@ -52,3 +53,31 @@ class TestParseCsv:
         f.write_text("id,name\n1,foo\n")
         with pytest.raises(ValueError, match="doi"):
             parse_dois(f)
+
+
+class TestParseXlsx:
+    def _create_xlsx(self, path: Path, rows: list[list[str]]):
+        wb = Workbook()
+        ws = wb.active
+        for row in rows:
+            ws.append(row)
+        wb.save(path)
+
+    def test_parse_xlsx_with_doi_column(self, tmp_path: Path):
+        f = tmp_path / "test.xlsx"
+        self._create_xlsx(f, [["doi", "tag"], ["10.1234/test", "a"], ["10.5678/test2", "b"]])
+        dois = parse_dois(f)
+        assert len(dois) == 2
+        assert "10.1234/test" in dois
+
+    def test_parse_xlsx_deduplicates(self, tmp_path: Path):
+        f = tmp_path / "test.xlsx"
+        self._create_xlsx(f, [["doi"], ["10.1234/test"], ["10.1234/test"]])
+        dois = parse_dois(f)
+        assert len(dois) == 1
+
+    def test_parse_xlsx_skips_empty_rows(self, tmp_path: Path):
+        f = tmp_path / "test.xlsx"
+        self._create_xlsx(f, [["doi"], ["10.1234/test"], [""]])
+        dois = parse_dois(f)
+        assert len(dois) == 1

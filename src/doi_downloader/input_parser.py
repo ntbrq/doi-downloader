@@ -1,6 +1,8 @@
 import csv
 from pathlib import Path
 
+from openpyxl import load_workbook
+
 
 def parse_dois(file_path: Path) -> list[str]:
     """从文件解析 DOI 列表，支持 txt/csv/xlsx，返回去重列表。"""
@@ -45,4 +47,23 @@ def _parse_csv(file_path: Path) -> list[str]:
 
 
 def _parse_xlsx(file_path: Path) -> list[str]:
-    raise NotImplementedError
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return []
+    header = [str(h).strip().lower() if h else "" for h in rows[0]]
+    if "doi" not in header:
+        raise ValueError(f"Excel file must have a 'doi' column. Found: {header}")
+    doi_idx = header.index("doi")
+    dois: list[str] = []
+    seen: set[str] = set()
+    for row in rows[1:]:
+        if doi_idx >= len(row) or row[doi_idx] is None:
+            continue
+        doi = str(row[doi_idx]).strip()
+        if doi and doi not in seen:
+            seen.add(doi)
+            dois.append(doi)
+    wb.close()
+    return dois
