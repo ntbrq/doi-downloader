@@ -230,18 +230,61 @@ class BrowserSource(DownloadSource):
             page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
             self._wait_for_cloudflare(page)
 
+            # 如果页面本身就是 PDF（嵌入的 PDF 查看器）
             if self._page_is_pdf_viewer(page):
-                return self._download_pdf_url(url, dest)
+                return self._download_with_browser_context(page, url, dest)
 
+            # 从页面中提取 PDF 链接
             pdf_url = self._extract_pdf_from_page(page, url)
             if pdf_url:
-                return self._download_pdf_url(pdf_url, dest)
+                return self._download_with_browser_context(page, pdf_url, dest)
 
-            return False
+            # 尝试查找并点击 PDF 下载链接（触发浏览器下载）
+            return self._try_click_download(page, dest)
+
         except Exception:
             return False
         finally:
             ctx.close()
+
+    def _try_click_download(self, page, dest: Path) -> bool:
+        """尝试点击页面上的 PDF 下载链接，捕获浏览器下载事件。"""
+        try:
+            # 查找可能的 PDF 下载链接
+            selectors = [
+                "a[href*='.pdf']",
+                "a[href*='/pdf']",
+                "a[href*='getpdf']",
+                "a[href*='download']",
+                "a.download",
+                "a[title*='PDF']",
+                "a[aria-label*='PDF']",
+                "button:has-text('Download PDF')",
+                "button:has-text('PDF')",
+            ]
+
+            for selector in selectors:
+                try:
+                    element = page.query_selector(selector)
+                    if element:
+                        # 使用 expect_download 捕获下载事件
+                        with page.expect_download(timeout=30000) as download_info:
+                            element.click()
+
+                        download = download_info.value
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        download.save_as(str(dest))
+
+                        if self.is_pdf(dest):
+                            return True
+                        else:
+                            dest.unlink(missing_ok=True)
+                except Exception:
+                    continue
+
+            return False
+        except Exception:
+            return False
 
     def download(self, url: str, dest: Path) -> bool:
         """通过浏览器下载 PDF（线程安全）。"""
@@ -251,8 +294,42 @@ class BrowserSource(DownloadSource):
         except Exception:
             return False
 
+    def _download_with_browser_context(self, page, url: str, dest: Path) -> bool:
+        """使用浏览器页面的请求上下文下载 PDF（自动携带 cookie）。"""
+        try:
+            # 使用页面的 API 请求，自动携带 cookie 和认证信息
+            response = page.request.get(url, timeout=int(self.timeout * 1000))
+
+            if not response.ok:
+                return False
+
+            # 检查内容类型是否为 PDF
+            content_type = response.headers.get("content-type", "")
+            if "application/pdf" not in content_type and not url.lower().endswith(".pdf"):
+                # 可能是重定向页面，尝试在页面中查找真实 PDF URL
+                return False
+
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            body = response.body()
+
+            # 验证是否为有效 PDF
+            if not body.startswith(b"%PDF"):
+                dest.unlink(missing_ok=True)
+                return False
+
+            dest.write_bytes(body)
+
+            if not self.is_pdf(dest):
+                dest.unlink(missing_ok=True)
+                return False
+            return True
+
+        except Exception:
+            dest.unlink(missing_ok=True)
+            return False
+
     def _download_pdf_url(self, url: str, dest: Path) -> bool:
-        """通过 httpx 下载 PDF 文件。"""
+        """回退方案：通过 httpx 下载 PDF 文件（不携带浏览器 cookie）。"""
         import httpx
 
         headers = {"User-Agent": self.REALISTIC_UA}
