@@ -1,13 +1,12 @@
 """基于 Playwright 的下载源。处理 JS 渲染页面和 Cloudflare 验证。
 
-设计原则：
-- 自包含：使用 Playwright 自带的 Chromium，不依赖系统浏览器
-- 智能代理：自动检测但默认绕过系统代理（避免被封锁的代理 IP）
-- 环境自适应：自动检测 VPN/校园网环境
-- 优雅降级：BrowserSource 失败时回退到其他源
+Zotero 模式：自动查找 + 人工辅助认证
+1. 先用 headless 模式尝试（完全自动）
+2. 遇到 Cloudflare 反爬时，弹出可见浏览器窗口
+3. 用户手动完成一次认证
+4. 认证后自动继续下载，cookie 持久化复用
 """
 
-import os
 import re
 import threading
 import urllib.request
@@ -22,117 +21,70 @@ from doi_downloader.sources.base import DownloadSource
 
 
 class BrowserSource(DownloadSource):
-    """通过 Playwright 无头浏览器下载 PDF。处理 Cloudflare 和 JS 渲染页面。"""
+    """通过 Playwright 浏览器下载 PDF。支持人工辅助 Cloudflare 认证。"""
 
     name = "browser"
 
-    # 真实的 Chrome User Agent（不包含 HeadlessChrome 标记）
     REALISTIC_UA = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/126.0.6478.127 Safari/537.36"
     )
 
-    # Stealth 脚本：隐藏自动化特征
     STEALTH_SCRIPT = """
-        // 覆盖 navigator.webdriver
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
-        });
-
-        // 覆盖 chrome.runtime
-        window.chrome = {
-            runtime: {},
-            loadTimes: function() {},
-            csi: function() {},
-            app: {}
-        };
-
-        // 覆盖 permissions
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
         const originalQuery = window.navigator.permissions.query;
         window.navigator.permissions.query = (parameters) => (
             parameters.name === 'notifications' ?
                 Promise.resolve({ state: Notification.permission }) :
                 originalQuery(parameters)
         );
-
-        // 覆盖 plugins
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5]
-        });
-
-        // 覆盖 languages
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en']
-        });
-
-        // 覆盖 platform
-        Object.defineProperty(navigator, 'platform', {
-            get: () => 'Win32'
-        });
-
-        // 覆盖 hardwareConcurrency
-        Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: () => 8
-        });
-
-        // 覆盖 deviceMemory
-        Object.defineProperty(navigator, 'deviceMemory', {
-            get: () => 8
-        });
-
-        // 隐藏自动化相关属性
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
         delete navigator.__proto__.webdriver;
     """
 
     def __init__(self, timeout: float = 60.0, use_system_proxy: bool = False):
-        """
-        初始化 BrowserSource。
-
-        Args:
-            timeout: 超时时间（秒）
-            use_system_proxy: 是否使用系统代理。默认为 False，因为：
-                - 系统代理 IP 可能被学术出版商封锁
-                - VPN/校园网环境下，直接连接通常更可靠
-                - 如果确实需要代理，用户可以通过参数显式指定
-        """
         self.timeout = timeout
         self.use_system_proxy = use_system_proxy
         self._lock = threading.Lock()
         self._pw = None
         self._browser = None
-        # 专用单线程执行器，保证 Playwright 操作在同一线程
+        self._headed_browser = None
+        # 持久化 context，保存人工认证后的 cookie
+        self._persistent_ctx = None
+        self._headed_mode_used = False
         self._executor = ThreadPoolExecutor(max_workers=1)
 
     def _detect_proxy(self) -> str | None:
-        """检测系统代理设置。"""
         if not self.use_system_proxy:
             return None
-
         try:
             proxies = urllib.request.getproxies()
             return proxies.get("http") or proxies.get("https")
         except Exception:
             return None
 
-    def _ensure_browser(self):
-        """懒初始化共享的 Playwright 浏览器实例（必须在专用线程中调用）。"""
-        if self._browser is not None:
+    def _ensure_playwright(self):
+        if self._pw is not None:
             return
-
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
 
-        proxy_url = self._detect_proxy()
+    def _ensure_browser(self):
+        if self._browser is not None:
+            return
+        self._ensure_playwright()
 
-        # 使用 Playwright 自带的 Chromium（自包含，不依赖系统浏览器）
         launch_options = {
             "headless": True,
             "args": [
-                # 禁用自动化标志，避免被检测
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
-                # 基础配置
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
@@ -141,37 +93,63 @@ class BrowserSource(DownloadSource):
                 "--disable-infobars",
                 "--disable-extensions",
                 "--disable-popup-blocking",
-                # 禁用系统代理（除非显式指定）
-                "--no-proxy-server" if not proxy_url else "",
             ],
-            # 去掉默认的自动化标志
             "ignore_default_args": ["--enable-automation"],
         }
 
-        # 清理空字符串参数
-        launch_options["args"] = [arg for arg in launch_options["args"] if arg]
-
+        proxy_url = self._detect_proxy()
         if proxy_url:
-            print(f"  Using specified proxy: {proxy_url}")
             launch_options["proxy"] = {"server": proxy_url}
+            print(f"  Browser proxy: {proxy_url}")
         else:
-            print(f"  Direct connection (no proxy)")
+            launch_options["args"].append("--no-proxy-server")
 
         self._browser = self._pw.chromium.launch(**launch_options)
-        self._using_persistent_context = False
+
+    def _launch_headed_browser(self):
+        """启动可见浏览器窗口（用于人工辅助认证）。"""
+        self._ensure_playwright()
+
+        launch_options = {
+            "headless": False,  # 可见窗口！
+            "slow_mo": 100,     # 稍微减速，让用户能看到操作
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--window-size=1280,900",
+            ],
+            "ignore_default_args": ["--enable-automation"],
+        }
+
+        proxy_url = self._detect_proxy()
+        if proxy_url:
+            launch_options["proxy"] = {"server": proxy_url}
+
+        return self._pw.chromium.launch(**launch_options)
 
     def _close_in_thread(self):
-        """在专用线程中关闭浏览器。"""
+        if self._persistent_ctx:
+            try:
+                self._persistent_ctx.close()
+            except Exception:
+                pass
+            self._persistent_ctx = None
+        if self._headed_browser:
+            try:
+                self._headed_browser.close()
+            except Exception:
+                pass
+            self._headed_browser = None
         if self._browser:
             self._browser.close()
             self._browser = None
         if self._pw:
             self._pw.stop()
             self._pw = None
-        self._using_persistent_context = False
 
     def close(self):
-        """关闭浏览器实例和执行器。"""
         try:
             self._executor.submit(self._close_in_thread).result(timeout=10)
         except Exception:
@@ -179,69 +157,208 @@ class BrowserSource(DownloadSource):
         self._executor.shutdown(wait=False)
 
     def find_pdf_url(self, doi: str, metadata: PaperMetadata) -> str | None:
-        """通过浏览器渲染页面查找 PDF 链接（线程安全）。"""
         future = self._executor.submit(self._find_pdf_url_in_thread, doi)
         try:
             return future.result(timeout=self.timeout * 3)
         except Exception:
             return None
 
-    def _create_context(self):
-        """创建浏览器上下文（注入 stealth 脚本）。"""
-        ctx = self._browser.new_context(
+    def _create_context(self, browser=None):
+        """创建浏览器上下文。"""
+        target = browser or self._browser
+        ctx = target.new_context(
             user_agent=self.REALISTIC_UA,
             accept_downloads=True,
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
         )
-        # 注入 stealth 脚本
         ctx.add_init_script(self.STEALTH_SCRIPT)
         return ctx
 
-    def _find_pdf_url_in_thread(self, doi: str) -> str | None:
-        """在专用线程中查找 PDF URL。"""
-        self._ensure_browser()
-        ctx = self._create_context()
+    # ── Cloudflare 检测 ──────────────────────────────────────────
 
+    def _is_blocked(self, page) -> bool:
+        """检测页面是否被反爬系统拦截。"""
+        try:
+            html = page.content()
+            text = page.text_content("body") or ""
+
+            # Cloudflare 挑战页面
+            if any(kw in html for kw in [
+                "cf-browser-verification", "cf_chl_opt",
+                "challenge-platform", "cf-turnstile",
+                "Just a moment", "Checking your browser",
+            ]):
+                return True
+
+            # 明确的 IP 封锁
+            if "CLOUDFLARE_ERROR" in text or "IP+blocked" in text:
+                return True
+
+            return False
+        except Exception:
+            return False
+
+    def _wait_for_cloudflare_auto(self, page, max_wait: int = 15) -> bool:
+        """等待 Cloudflare 自动通过（headless 模式下有时能自动解决简单挑战）。
+        返回 True 表示已通过，False 表示需要人工干预。"""
+        for _ in range(max_wait):
+            if not self._is_blocked(page):
+                return True
+            page.wait_for_timeout(1000)
+        return False
+
+    # ── 人工辅助认证（Zotero 模式）────────────────────────────────
+
+    def _human_assisted_auth(self, url: str) -> bool:
+        """弹出可见浏览器窗口，等待用户手动完成 Cloudflare 认证。
+        认证成功后保存 cookie 供后续 headless 请求复用。
+
+        Returns:
+            True 表示认证成功，False 表示用户放弃或超时
+        """
+        print(f"\n  ╔══════════════════════════════════════════════════════╗")
+        print(f"  ║  需要人工辅助认证                                    ║")
+        print(f"  ║  浏览器窗口即将打开，请完成 Cloudflare 验证          ║")
+        print(f"  ║  认证完成后程序会自动继续下载                        ║")
+        print(f"  ╚══════════════════════════════════════════════════════╝")
+        print(f"  目标: {url}")
+
+        try:
+            self._headed_browser = self._launch_headed_browser()
+            ctx = self._create_context(self._headed_browser)
+            page = ctx.new_page()
+
+            page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
+
+            # 等待用户完成认证（最多 5 分钟）
+            print(f"  等待认证中...（最多 5 分钟）")
+            for i in range(300):  # 5 分钟
+                if not self._is_blocked(page):
+                    print(f"  ✓ 认证成功！")
+                    # 保存 cookie 到持久化 context
+                    cookies = ctx.cookies()
+                    self._save_cookies(cookies, ctx)
+                    page.close()
+                    ctx.close()
+                    self._headed_browser.close()
+                    self._headed_browser = None
+                    self._headed_mode_used = True
+                    return True
+                page.wait_for_timeout(1000)
+
+            print(f"  ✗ 认证超时")
+            page.close()
+            ctx.close()
+            self._headed_browser.close()
+            self._headed_browser = None
+            return False
+
+        except Exception as e:
+            print(f"  ✗ 认证失败: {e}")
+            if self._headed_browser:
+                try:
+                    self._headed_browser.close()
+                except Exception:
+                    pass
+                self._headed_browser = None
+            return False
+
+    def _save_cookies(self, cookies: list, source_ctx):
+        """保存 cookie 到持久化 context，供后续 headless 请求复用。"""
+        # 创建持久化 context（如果不存在）
+        if self._persistent_ctx is None:
+            self._ensure_browser()
+            self._persistent_ctx = self._create_context()
+
+        # 将 cookie 注入到持久化 context
+        if cookies:
+            try:
+                self._persistent_ctx.add_cookies(cookies)
+            except Exception:
+                pass
+
+    def _get_context(self):
+        """获取浏览器 context，优先使用持久化 context（含认证 cookie）。"""
+        if self._persistent_ctx:
+            return self._persistent_ctx
+        return self._create_context()
+
+    # ── PDF URL 查找 ─────────────────────────────────────────────
+
+    def _find_pdf_url_in_thread(self, doi: str) -> str | None:
+        self._ensure_browser()
+
+        # Phase 1: 尝试 headless 模式（完全自动）
+        ctx = self._create_context()
         try:
             page = ctx.new_page()
 
-            # 尝试 DOI 重定向
             doi_url = f"https://doi.org/{doi}"
-            url = self._find_pdf_from_url(page, doi_url)
+            url = self._try_find_pdf(page, doi_url)
             if url:
                 return url
 
-            # 尝试出版商特定 URL
             for pub_url in self._build_publisher_urls(doi):
-                url = self._find_pdf_from_url(page, pub_url)
+                url = self._try_find_pdf(page, pub_url)
                 if url:
                     return url
 
+            # headless 模式被拦截，检查是否需要人工认证
+            page2 = ctx.new_page()
+            page2.goto(doi_url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
+
+            if self._is_blocked(page2):
+                page2.close()
+                page.close()
+                ctx.close()
+
+                # Phase 2: 弹出可见浏览器，等待人工认证
+                auth_ok = self._human_assisted_auth(doi_url)
+                if not auth_ok:
+                    return None
+
+                # Phase 3: 用认证后的 cookie 重试 headless 模式
+                ctx2 = self._get_context()
+                page3 = ctx2.new_page()
+                try:
+                    url = self._try_find_pdf(page3, doi_url)
+                    if url:
+                        return url
+
+                    for pub_url in self._build_publisher_urls(doi):
+                        url = self._try_find_pdf(page3, pub_url)
+                        if url:
+                            return url
+                finally:
+                    page3.close()
+                    if ctx2 is not self._persistent_ctx:
+                        ctx2.close()
+
+                return None
+
+            page2.close()
             return None
+
         except Exception:
             return None
         finally:
             page.close()
             ctx.close()
 
-    def _find_pdf_from_url(self, page, url: str) -> str | None:
-        """访问 URL，在渲染后的页面中查找 PDF 链接。"""
+    def _try_find_pdf(self, page, url: str) -> str | None:
+        """访问 URL，尝试查找 PDF 链接。"""
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
-            self._wait_for_cloudflare(page)
-            page.wait_for_timeout(5000)  # 等待 JavaScript 渲染完成
+            self._wait_for_cloudflare_auto(page, max_wait=10)
+            page.wait_for_timeout(5000)
 
-            # 检查页面是否被反爬系统拦截
-            page_text = page.text_content("body") or ""
-            if "CLOUDFLARE_ERROR" in page_text or "IP+blocked" in page_text:
-                print(f"    [BLOCKED] Page blocked by anti-bot system")
+            if self._is_blocked(page):
                 return None
 
             if self._page_is_pdf_viewer(page):
                 return url
 
-            # 尝试点击 PDF 按钮（ScienceDirect 等需要点击才显示 PDF 链接）
             pdf_url = self._try_click_pdf_button(page, url)
             if pdf_url:
                 return pdf_url
@@ -250,23 +367,10 @@ class BrowserSource(DownloadSource):
         except Exception:
             return None
 
-    def _wait_for_cloudflare(self, page):
-        """等待 Cloudflare 验证页面通过。"""
-        try:
-            for _ in range(15):  # 最多等待 15 秒
-                html = page.content()
-                if "cf-browser-verification" not in html and "cf_chl_opt" not in html:
-                    break
-                page.wait_for_timeout(1000)
-        except Exception:
-            pass
-
     def _page_is_pdf_viewer(self, page) -> bool:
-        """检查页面是否是 PDF 查看器。"""
         try:
             for selector in ["embed[type='application/pdf']", "iframe[src*='.pdf']"]:
-                elements = page.query_selector_all(selector)
-                if elements:
+                if page.query_selector_all(selector):
                     return True
             if page.url.lower().endswith(".pdf"):
                 return True
@@ -275,62 +379,51 @@ class BrowserSource(DownloadSource):
         return False
 
     def _try_click_pdf_button(self, page, base_url: str) -> str | None:
-        """尝试点击页面上的 PDF 查看/下载按钮。"""
-        # 常见的 PDF 按钮选择器
-        pdf_button_selectors = [
-            "a.accessbar-tooltip-link",  # ScienceDirect "View PDF" 按钮
+        selectors = [
+            "a.accessbar-tooltip-link",
             "a[data-aa-name='view-pdf']",
             "a:has-text('View PDF')",
             "a:has-text('Download PDF')",
             "a:has-text('PDF')",
-            "a[href*='pdfdirect']",  # Wiley
-            "a[href*='/pdf/']",  # 通用 PDF 链接
+            "a[href*='pdfdirect']",
+            "a[href*='/pdf/']",
         ]
 
-        for selector in pdf_button_selectors:
+        for selector in selectors:
             try:
                 btn = page.query_selector(selector)
                 if btn and btn.is_visible():
                     href = btn.get_attribute("href")
                     if href and (".pdf" in href.lower() or "/pdf" in href.lower()):
                         return urljoin(base_url, href)
-                    # 点击按钮，可能触发导航或下载
                     btn.click()
                     page.wait_for_timeout(3000)
-                    # 检查是否导航到了 PDF 页面
                     if self._page_is_pdf_viewer(page):
                         return page.url
-                    # 再次提取链接
                     pdf_url = self._extract_pdf_from_page(page, base_url)
                     if pdf_url:
                         return pdf_url
             except Exception:
                 continue
-
         return None
 
     def _extract_pdf_from_page(self, page, base_url: str) -> str | None:
-        """从渲染后的页面 HTML 中提取 PDF 链接。"""
         html = page.content()
         soup = BeautifulSoup(html, "html.parser")
 
-        # 优先从 meta 标签获取
         for meta in soup.find_all("meta", attrs={"name": "citation_pdf_url"}):
             url = meta.get("content")
             if url:
                 return url
 
-        # 尝试出版商特定提取
         url = self._extract_publisher_specific(soup, base_url, html)
         if url:
             return url
 
-        # 通用 PDF 链接提取
         pdf_candidates: list[str] = []
         for a in soup.find_all("a", href=True):
             href = a["href"]
             href_lower = href.lower()
-            # 跳过无关链接
             if any(skip in href_lower for skip in ["signup", "login", "register", "help", "faq", "cookie"]):
                 continue
             if ".pdf" in href_lower or "/pdf" in href_lower or "getpdf" in href_lower:
@@ -339,7 +432,6 @@ class BrowserSource(DownloadSource):
         if pdf_candidates:
             return max(pdf_candidates, key=len)
 
-        # 检查 iframe/embed
         for tag_name in ["iframe", "embed"]:
             for tag in soup.find_all(tag_name, src=True):
                 src = tag["src"].lower()
@@ -349,7 +441,6 @@ class BrowserSource(DownloadSource):
         return None
 
     def _extract_publisher_specific(self, soup: BeautifulSoup, base_url: str, html: str) -> str | None:
-        """针对特定出版商提取 PDF 链接。"""
         if "ieeexplore.ieee.org" in base_url:
             for a in soup.find_all("a", href=True):
                 href = a["href"]
@@ -383,63 +474,73 @@ class BrowserSource(DownloadSource):
         return None
 
     def _build_publisher_urls(self, doi: str) -> list[str]:
-        """构造已知出版商的 DOI 页面 URL。"""
         urls: list[str] = []
-
         if doi.startswith("10.1109/"):
             urls.append(f"https://ieeexplore.ieee.org/document/{doi.split('/')[-1]}")
-
         if doi.startswith("10.1016/"):
             article_id = doi.split("/", 1)[1]
             urls.append(f"https://www.sciencedirect.com/science/article/pii/{article_id}")
-
         if doi.startswith("10.3389/"):
             urls.append(f"https://www.frontiersin.org/articles/{doi}")
-
         if doi.startswith("10.2139/"):
             ssrn_id = doi.split(".")[-1]
             urls.append(f"https://papers.ssrn.com/sol3/papers.cfm?abstract_id={ssrn_id}")
-
         return urls
 
+    # ── PDF 下载 ─────────────────────────────────────────────────
+
+    def download(self, url: str, dest: Path) -> bool:
+        future = self._executor.submit(self._download_in_thread, url, dest)
+        try:
+            return future.result(timeout=self.timeout * 3)
+        except Exception:
+            return False
+
     def _download_in_thread(self, url: str, dest: Path) -> bool:
-        """在专用线程中下载 PDF。"""
-        self._ensure_browser()
-        ctx = self._create_context()
+        # 优先使用含认证 cookie 的 context
+        ctx = self._get_context()
+        should_close_ctx = ctx is not self._persistent_ctx
 
         try:
             page = ctx.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
-            self._wait_for_cloudflare(page)
+            self._wait_for_cloudflare_auto(page, max_wait=10)
 
-            # 如果页面本身就是 PDF（嵌入的 PDF 查看器）
+            if self._is_blocked(page):
+                # 需要人工认证
+                auth_ok = self._human_assisted_auth(url)
+                if not auth_ok:
+                    return False
+                # 用认证后的 cookie 重试
+                ctx2 = self._get_context()
+                page.close()
+                page = ctx2.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
+                self._wait_for_cloudflare_auto(page, max_wait=10)
+
             if self._page_is_pdf_viewer(page):
-                return self._download_with_browser_context(page, url, dest)
+                return self._download_with_context(page, url, dest)
 
-            # 从页面中提取 PDF 链接
             pdf_url = self._extract_pdf_from_page(page, url)
             if pdf_url:
-                return self._download_with_browser_context(page, pdf_url, dest)
+                return self._download_with_context(page, pdf_url, dest)
 
-            # 尝试查找并点击 PDF 下载链接（触发浏览器下载）
             return self._try_click_download(page, dest)
 
         except Exception:
             return False
         finally:
             page.close()
-            ctx.close()
+            if should_close_ctx:
+                ctx.close()
 
-    def _download_with_browser_context(self, page, url: str, dest: Path) -> bool:
-        """使用浏览器页面的请求上下文下载 PDF（自动携带 cookie）。"""
+    def _download_with_context(self, page, url: str, dest: Path) -> bool:
+        """使用浏览器上下文下载 PDF（携带 cookie）。"""
         try:
-            # 使用页面的 API 请求，自动携带 cookie 和认证信息
             response = page.request.get(url, timeout=int(self.timeout * 1000))
-
             if not response.ok:
                 return False
 
-            # 检查内容类型是否为 PDF
             content_type = response.headers.get("content-type", "")
             if "application/pdf" not in content_type and not url.lower().endswith(".pdf"):
                 return False
@@ -447,13 +548,11 @@ class BrowserSource(DownloadSource):
             dest.parent.mkdir(parents=True, exist_ok=True)
             body = response.body()
 
-            # 验证是否为有效 PDF
             if not body.startswith(b"%PDF"):
                 dest.unlink(missing_ok=True)
                 return False
 
             dest.write_bytes(body)
-
             if not self.is_pdf(dest):
                 dest.unlink(missing_ok=True)
                 return False
@@ -464,48 +563,31 @@ class BrowserSource(DownloadSource):
             return False
 
     def _try_click_download(self, page, dest: Path) -> bool:
-        """尝试点击页面上的 PDF 下载链接，捕获浏览器下载事件。"""
-        try:
-            # 查找可能的 PDF 下载链接
-            selectors = [
-                "a[href*='.pdf']",
-                "a[href*='/pdf']",
-                "a[href*='getpdf']",
-                "a[href*='download']",
-                "a.download",
-                "a[title*='PDF']",
-                "a[aria-label*='PDF']",
-                "button:has-text('Download PDF')",
-                "button:has-text('PDF')",
-            ]
+        selectors = [
+            "a[href*='.pdf']",
+            "a[href*='/pdf']",
+            "a[href*='getpdf']",
+            "a[href*='download']",
+            "a.download",
+            "a[title*='PDF']",
+            "a[aria-label*='PDF']",
+            "button:has-text('Download PDF')",
+            "button:has-text('PDF')",
+        ]
 
-            for selector in selectors:
-                try:
-                    element = page.query_selector(selector)
-                    if element:
-                        # 使用 expect_download 捕获下载事件
-                        with page.expect_download(timeout=30000) as download_info:
-                            element.click()
-
-                        download = download_info.value
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        download.save_as(str(dest))
-
-                        if self.is_pdf(dest):
-                            return True
-                        else:
-                            dest.unlink(missing_ok=True)
-                except Exception:
-                    continue
-
-            return False
-        except Exception:
-            return False
-
-    def download(self, url: str, dest: Path) -> bool:
-        """通过浏览器下载 PDF（线程安全）。"""
-        future = self._executor.submit(self._download_in_thread, url, dest)
-        try:
-            return future.result(timeout=self.timeout * 3)
-        except Exception:
-            return False
+        for selector in selectors:
+            try:
+                element = page.query_selector(selector)
+                if element:
+                    with page.expect_download(timeout=30000) as download_info:
+                        element.click()
+                    download = download_info.value
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    download.save_as(str(dest))
+                    if self.is_pdf(dest):
+                        return True
+                    else:
+                        dest.unlink(missing_ok=True)
+            except Exception:
+                continue
+        return False
