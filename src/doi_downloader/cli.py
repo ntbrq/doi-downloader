@@ -10,6 +10,7 @@ from doi_downloader.config import Config
 from doi_downloader.downloader import BatchDownloader, DownloadResult
 from doi_downloader.input_parser import parse_dois
 from doi_downloader.metadata import resolve_metadata
+from doi_downloader.sources.browser import BrowserSource
 from doi_downloader.sources.direct_url import DirectUrlSource
 from doi_downloader.sources.publisher import PublisherSource
 from doi_downloader.sources.scihub import SciHubSource
@@ -38,16 +39,18 @@ def main(input_file: Path, output_dir: Path, workers: int, scihub_url: str, emai
 
     click.echo(f"Found {len(dois)} unique DOIs.")
 
+    browser_source = BrowserSource(timeout=60.0)
     sources = [
         DirectUrlSource(timeout=60.0, max_retries=2),
         PublisherSource(timeout=60.0, max_retries=2),
         SemanticScholarSource(timeout=30.0),
         UnpaywallSource(email=email, timeout=30.0),
+        browser_source,
         SciHubSource(base_url=scihub_url, timeout=60.0),
     ]
 
     config = Config(max_download_workers=workers, scihub_url=scihub_url, unpaywall_email=email)
-    downloader = BatchDownloader(sources=sources, max_workers=workers, config=config)
+    downloader = BatchDownloader(sources=sources, max_workers=workers, config=config, browser_source=browser_source)
 
     pbar = tqdm(total=len(dois), desc="Downloading", unit="paper")
 
@@ -58,9 +61,13 @@ def main(input_file: Path, output_dir: Path, workers: int, scihub_url: str, emai
         else:
             pbar.set_postfix_str(f"FAIL: {result.error}")
 
-    results = downloader.download_all(
-        dois, output_dir, metadata_resolver=resolve_metadata, progress_callback=on_progress
-    )
+    try:
+        results = downloader.download_all(
+            dois, output_dir, metadata_resolver=resolve_metadata, progress_callback=on_progress
+        )
+    finally:
+        browser_source.close()
+
     pbar.close()
 
     success = [r for r in results if r.success]

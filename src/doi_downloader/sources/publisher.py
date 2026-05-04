@@ -35,21 +35,54 @@ def _build_known_pdf_urls(doi: str) -> list[str]:
     # MDPI: 10.3390/JOURNAL/ISSUE/ARTICLE (e.g. 10.3390/mi15020253)
     m = re.match(r"10\.3390/([a-z]+)(\d+)(\d+)(\d+)", doi)
     if m:
-        journal = m.group(1)
-        volume = m.group(2)
-        issue = m.group(3)
-        article = m.group(4)
+        journal, volume, issue, article = m.groups()
         urls.append(f"https://www.mdpi.com/{journal}/{volume}/{issue}/{article}/pdf")
 
-    # Frontiers: 10.3389/JOURNAL.YEAR.NNNNNN 或 10.3389/fxxxx.NNNNNN
+    # Frontiers: 10.3389/xxxx.NNNNNN — open access
     if doi.startswith("10.3389/"):
-        # Frontiers 的 DOI 解析后重定向到有 PDF 的页面
-        # 先保留空，由 HTML 解析处理
-        pass
+        urls.append(f"https://www.frontiersin.org/articles/{doi}/pdf")
 
-    # AIP: 10.1063/NN.NNNNNN -> https://pubs.aip.org/aip/.../pdf
+    # SSRN: 10.2139/ssrn.NNNNNNN — preprints, usually open
+    if doi.startswith("10.2139/"):
+        ssrn_id = doi.split(".")[-1]
+        urls.append(f"https://papers.ssrn.com/sol3/Delivery.cfm/SSRN_ID{ssrn_id}_code.pdf")
+
+    # IEEE: 10.1109/xxxxx 或 10.23919/xxxxx
+    if doi.startswith("10.1109/") or doi.startswith("10.23919/"):
+        # IEEE 的 PDF 需要从 Xplore 页面解析，但可以尝试 stamp URL
+        article_num = doi.split(".")[-1]
+        urls.append(f"https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={article_num}")
+
+    # Elsevier/ScienceDirect: 10.1016/j.xxxx
+    if doi.startswith("10.1016/"):
+        pii = doi.split("/", 1)[1].replace("/", "")
+        urls.append(f"https://www.sciencedirect.com/science/article/pii/{pii}/pdfft")
+        urls.append(f"https://www.sciencedirect.com/science/article/pii/{pii}")
+
+    # ACS: 10.1021/xxxxx
+    if doi.startswith("10.1021/"):
+        urls.append(f"https://pubs.acs.org/doi/pdf/{doi}")
+
+    # Nature: 10.1038/xxxxx
+    if doi.startswith("10.1038/"):
+        article = doi.split("/", 1)[1]
+        urls.append(f"https://www.nature.com/articles/{article}.pdf")
+
+    # Science/AAAS: 10.1126/xxxxx
+    if doi.startswith("10.1126/"):
+        urls.append(f"https://www.science.org/doi/pdf/{doi}")
+
+    # IOP: 10.1088/xxxx-xxxx/xx/xx/xxxxx
+    if doi.startswith("10.1088/"):
+        urls.append(f"https://iopscience.iop.org/article/{doi}/pdf")
+
+    # Wiley: 10.1002/xxxxx
+    if doi.startswith("10.1002/"):
+        urls.append(f"https://onlinelibrary.wiley.com/doi/pdfdirect/{doi}")
+
+    # AIP: 10.1063/NN.NNNNNN
     if doi.startswith("10.1063/"):
-        pass  # AIP 需要解析，由 HTML 处理
+        urls.append(f"https://pubs.aip.org/aip/apl/article-pdf/{doi.split('/', 1)[1]}")
 
     # Generic patterns
     for prefix, pattern in _PUBLISHER_PDF_PATTERNS:

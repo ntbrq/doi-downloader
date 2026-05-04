@@ -10,4 +10,4 @@ class Config:
     browser_timeout: float = 60.0
     user_agent: str = "doi-downloader/0.1 (mailto:user@example.com)"
     scihub_url: str = "https://sci-hub.se"
-    unpaywall_email: str = "user@example.com"
+    unpaywall_email: str = "doi-downloader@github.com"

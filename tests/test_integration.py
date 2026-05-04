@@ -28,20 +28,30 @@ class TestIntegration:
 
         from doi_downloader.sources.base import DownloadSource
 
-        class MockSource(DownloadSource):
-            name = "mock"
+        def _make_mock_source(name: str) -> DownloadSource:
+            class _MockSource(DownloadSource):
+                def __init__(self):
+                    self.name = name
 
-            def find_pdf_url(self, doi, metadata):
-                return f"https://example.com/{doi}.pdf"
+                def find_pdf_url(self, doi, metadata):
+                    return f"https://example.com/{doi}.pdf"
 
-            def download(self, url, dest):
-                dest.write_bytes(b"%PDF-1.4 mock content")
-                return True
+                def download(self, url, dest):
+                    dest.write_bytes(b"%PDF-1.4 mock content")
+                    return True
+
+                def close(self):
+                    pass
+
+            return _MockSource()
 
         with patch("doi_downloader.cli.resolve_metadata", side_effect=mock_resolve), \
-             patch("doi_downloader.cli.PublisherSource", return_value=MockSource()), \
-             patch("doi_downloader.cli.SciHubSource", return_value=MockSource()), \
-             patch("doi_downloader.cli.UnpaywallSource", return_value=MockSource()):
+             patch("doi_downloader.cli.DirectUrlSource", return_value=_make_mock_source("direct_url")), \
+             patch("doi_downloader.cli.PublisherSource", return_value=_make_mock_source("publisher")), \
+             patch("doi_downloader.cli.SemanticScholarSource", return_value=_make_mock_source("semantic_scholar")), \
+             patch("doi_downloader.cli.UnpaywallSource", return_value=_make_mock_source("unpaywall")), \
+             patch("doi_downloader.cli.BrowserSource", return_value=_make_mock_source("browser")), \
+             patch("doi_downloader.cli.SciHubSource", return_value=_make_mock_source("sci-hub")):
 
             runner = CliRunner()
             result = runner.invoke(main, [str(input_file), "-o", str(output_dir)])
