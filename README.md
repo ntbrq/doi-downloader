@@ -5,7 +5,11 @@ A batch DOI paper PDF downloader with multi-threaded downloading, multi-source f
 ## Features
 
 - **Batch download** from txt, csv, or xlsx files containing DOI lists
-- **Multi-source fallback** — tries Publisher site, then Sci-Hub, then Unpaywall automatically
+- **Concurrent source racing** — multiple download sources compete in parallel, first success wins
+- **Three-phase download strategy**:
+  - Phase 1: Fast HTTP sources race concurrently (DirectUrl → Publisher → SemanticScholar → Unpaywall → SciHub)
+  - Phase 2: BrowserSource retries URLs discovered in Phase 1
+  - Phase 3: BrowserSource independently finds and downloads PDFs
 - **Multi-threaded** — default 8 concurrent download threads
 - **Standardized renaming** — outputs `Author - Year - Title.pdf`
 - **Cloudflare bypass** — uses Playwright headless browser for JS challenges
@@ -100,11 +104,23 @@ parse_dois()          — parse txt/csv/xlsx → DOI list
 resolve_metadata()    — CrossRef API → PaperMetadata (title, authors, year, journal)
   │                    [ThreadPoolExecutor, 10 threads]
   ▼
-download_all()        — for each DOI, try sources in order:
-  │                    1. Publisher (DOI redirect → find PDF link)
-  │                    2. Sci-Hub  (Playwright → parse iframe)
-  │                    3. Unpaywall (OA API → PDF URL)
-  │                    [ThreadPoolExecutor, 8 threads]
+download_all()        — for each DOI, concurrent 3-phase strategy:
+  │
+  │  Phase 1: Non-browser sources race in parallel
+  │  ┌─────────────────────────────────────────────┐
+  │  │ DirectUrlSource ─┐                          │
+  │  │ PublisherSource ──┤                          │
+  │  │ SemanticScholar ──┼─→ First success wins    │
+  │  │ UnpaywallSource ──┤                          │
+  │  │ SciHubSource ─────┘                          │
+  │  └─────────────────────────────────────────────┘
+  │                    │
+  │                    ▼ (if Phase 1 fails)
+  │  Phase 2: BrowserSource retries URLs from Phase 1
+  │                    │
+  │                    ▼ (if Phase 2 fails)
+  │  Phase 3: BrowserSource finds URLs independently
+  │
   ▼
 rename_pdf()          — "Author - Year - Title.pdf"
   │
@@ -119,11 +135,13 @@ Output Directory      — PDFs + failed_dois.txt (if any)
 | `input_parser.py` | Parse DOI lists from txt/csv/xlsx |
 | `metadata.py` | Resolve DOI metadata via CrossRef API |
 | `renamer.py` | Rename PDFs to standardized format |
-| `browser.py` | Thread-safe Playwright browser pool |
-| `downloader.py` | Thread pool download orchestration with fallback |
+| `sources/browser.py` | Playwright-based browser source for JS/Cloudflare sites |
+| `downloader.py` | Concurrent source racing with 3-phase download strategy |
+| `sources/direct_url.py` | Direct PDF URL construction from DOI patterns |
 | `sources/publisher.py` | Download from publisher websites |
+| `sources/semantic_scholar.py` | Download from Semantic Scholar Open Access |
+| `sources/unpaywall.py` | Download from Unpaywall OA API |
 | `sources/scihub.py` | Download from Sci-Hub |
-| `sources/unpaywall.py` | Download from Unpaywall OA |
 | `cli.py` | CLI entry point with tqdm progress bar |
 | `config.py` | Configuration dataclass |
 
