@@ -34,3 +34,9 @@ playwright-report/
 # OS
 .DS_Store
 Thumbs.db
+
+# Chrome CDP profile
+.chrome-profile/
+
+# Debug files
+debug_*.html
